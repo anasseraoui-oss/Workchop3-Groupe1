@@ -1,7 +1,626 @@
- # Workshop 3 — Analyse SCA avec OWASP Dependency-Check et Trivy **Intégration de l'analyse de composition logicielle (SCA) dans GitHub Actions** ![OWASP Dependency-Check](https://img.shields.io/badge/OWASP-Dependency--Check-000000?logo=owasp&logoColor=white) ![Trivy](https://img.shields.io/badge/Trivy-SCA-1904DA?logo=aquasecurity&logoColor=white) ![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-CI-2088FF?logo=githubactions&logoColor=white) ![Dependabot](https://img.shields.io/badge/Dependabot-mises%20%C3%A0%20jour-025E8C?logo=dependabot&logoColor=white) ![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4.1.1-6DB33F?logo=springboot&logoColor=white) ![Java](https://img.shields.io/badge/Java-17-ED8B00?logo=openjdk&logoColor=white) ![Maven](https://img.shields.io/badge/Maven-multi--module-C71A36?logo=apachemaven&logoColor=white) ![NVD](https://img.shields.io/badge/NIST-NVD-005EA2)
-Ce workshop met en place une chaîne d'analyse de composition logicielle (**SCA**) sur un projet **Spring Boot / Maven** composé de deux microservices : à chaque `push` sur `main` (et à chaque pull request pour Dependency-Check), **GitHub Actions** analyse les **dépendances** du projet avec **OWASP Dependency-Check** (base **NVD** du NIST) et **Trivy** (base Aqua Security), publie les rapports comme artefacts et **fait échouer le workflow** lorsqu'une vulnérabilité grave est trouvée. **Dependabot** propose en parallèle les mises à jour de dépendances et d'actions GitHub. **À la lecture de ce document, vous saurez :** - ce qu'est la SCA et en quoi elle complète le SAST du workshop 1 ; - ce que Dependency-Check, Trivy et Dependabot détectent, et en quoi ils se complètent ; - comment les deux workflows GitHub Actions sont construits ; - quels problèmes ont été rencontrés (faux vert de Trivy, téléchargement NVD de plusieurs heures) et comment ils ont été résolus ; - quelles vulnérabilités ont été trouvées, corrigées et retestées, et quelles sont les limites de l'approche. > **Note sur les preuves.** Les chiffres de ce document proviennent des journaux réels des workflows GitHub Actions (dépôts `sanotogii/workshop3-Groupe1` et `anasseraoui-oss/Workchop3-Groupe1`) et des captures du dossier `docs/images/`. Lorsqu'aucune capture n'est disponible, le document cite un **extrait de journal** recopié tel quel depuis GitHub Actions. Les identifiants CVE sont ceux affichés par les outils au moment de l'exécution. Le rapport complet de Dependency-Check est fourni dans `dependency-check-report.zip`. --- ## Table des matières - [1. Présentation académique](#1-présentation-académique) - [2. Introduction et objectifs](#2-introduction-et-objectifs) - [2.1 Qu'est-ce que la SCA ?](#21-quest-ce-que-la-sca-) - [2.2 Pourquoi la SCA en plus du SAST ?](#22-pourquoi-la-sca-en-plus-du-sast-) - [2.3 Rôle de chaque outil](#23-rôle-de-chaque-outil) - [2.4 Complémentarité Dependency-Check / Trivy](#24-complémentarité-dependency-check--trivy) - [2.5 Objectifs pédagogiques](#25-objectifs-pédagogiques) - [3. Architecture du projet](#3-architecture-du-projet) - [3.1 Application analysée](#31-application-analysée) - [3.2 Flux d'analyse SCA](#32-flux-danalyse-sca) - [3.3 Composants](#33-composants) - [4. Environnement et prérequis](#4-environnement-et-prérequis) - [5. Configuration](#5-configuration) - [5.1 Plugin Dependency-Check dans le `pom.xml`](#51-plugin-dependency-check-dans-le-pomxml) - [5.2 Secret `NVD_API_KEY`](#52-secret-nvd_api_key) - [5.3 Dependabot](#53-dependabot) - [6. Workflow OWASP Dependency-Check](#6-workflow-owasp-dependency-check) - [6.1 Problème : téléchargement complet de la NVD à chaque exécution](#61-problème--téléchargement-complet-de-la-nvd-à-chaque-exécution) - [6.2 Première correction : cache et timeout](#62-première-correction--cache-et-timeout) - [6.3 Solution retenue : base NVD pré-construite](#63-solution-retenue--base-nvd-pré-construite) - [6.4 Workflow final](#64-workflow-final) - [7. Workflow Trivy](#7-workflow-trivy) - [7.1 Problème : un workflow vert qui n'analysait rien](#71-problème--un-workflow-vert-qui-nanalysait-rien) - [7.2 Correction : mode `rootfs`](#72-correction--mode-rootfs) - [7.3 Workflow final](#73-workflow-final) - [8. Résultats et corrections](#8-résultats-et-corrections) - [8.1 Vulnérabilités détectées](#81-vulnérabilités-détectées) - [8.2 Corrections appliquées](#82-corrections-appliquées) - [8.3 Retest](#83-retest) - [8.4 Comparaison des deux outils](#84-comparaison-des-deux-outils) - [9. Limites et recommandations](#9-limites-et-recommandations) - [10. Conclusion](#10-conclusion) - [11. Références](#11-références) --- ## 1. Présentation académique | | | |---|---| | **Département** | Département Informatique | | **Programme** | Master DevOps & Cloud Computing | | **Workshop** | Workshop 3 — Analyse SCA avec OWASP Dependency-Check et Trivy | | **Réalisé par** | LAZRAG Khalid · ERAOUI Anass · BOUTEFAH KHATIB Fatima Zohra | | **Responsable** | Pr. KOUISSI Mohamed | --- ## 2. Introduction et objectifs ### 2.1 Qu'est-ce que la SCA ? La **SCA** (*Software Composition Analysis*) consiste à inventorier les **bibliothèques tierces** utilisées par une application (dépendances directes et transitives) puis à comparer chaque composant et sa version à des bases de vulnérabilités connues (**CVE**). Elle répond à la question : *« est-ce que j'embarque un composant dont une faille est déjà publique ? »* ### 2.2 Pourquoi la SCA en plus du SAST ? Le SAST (workshop 1) analyse **le code écrit par l'équipe**. Or une application Spring Boot moderne embarque plusieurs dizaines de bibliothèques (ici **100 dépendances, dont 61 uniques**, analysées par Dependency-Check, **242 fichiers jar** par Trivy) dont le code n'est pas relu par l'équipe. Une faille comme **Log4Shell** (CVE-2021-44228) se trouve dans une bibliothèque, pas dans le code du projet : aucun outil SAST ne la signale, alors qu'un outil SCA la détecte immédiatement à partir du nom et de la version du composant. ### 2.3 Rôle de chaque outil | Outil | Rôle dans le workshop | Ce qu'il apporte | |---|---|---| | **OWASP Dependency-Check** | Plugin Maven qui identifie les composants (CPE, Package URL) et les compare à la base **NVD** du NIST | Rapport HTML/JSON détaillé, score **CVSS**, seuil d'échec configurable (`failBuildOnCVSS`) | | **Trivy** | Scanner d'Aqua Security exécuté en conteneur Docker sur les jars du projet | Base de vulnérabilités propre (GitHub Advisory, NVD…), téléchargée en quelques secondes, indique la **version corrigée** | | **Dependabot** | Service GitHub qui surveille les manifestes (`pom.xml`, workflows) | Ouvre automatiquement des pull requests de mise à jour | | **GitHub Actions** | Orchestrateur CI | Exécution à chaque push / pull request, artefacts, secrets | ### 2.4 Complémentarité Dependency-Check / Trivy Les deux outils n'utilisent ni la même base ni la même méthode d'identification. Dependency-Check s'appuie sur la NVD et sur une correspondance par **CPE**, ce qui peut produire des faux positifs mais couvre aussi des fichiers JavaScript embarqués dans des jars. Trivy s'appuie principalement sur les **avis de sécurité par écosystème** (Maven) et fournit la version qui corrige chaque faille. Ce workshop en donne un exemple concret : les failles **Jackson** ont été signalées par Trivy, et la faille **DOMPurify** embarquée dans `swagger-ui` uniquement par Dependency-Check (voir [§ 8.4](#84-comparaison-des-deux-outils)). ### 2.5 Objectifs pédagogiques 1. Intégrer Dependency-Check et Trivy dans des workflows GitHub Actions. 2. Faire échouer la CI lorsqu'une dépendance présente une vulnérabilité grave. 3. Gérer correctement un secret (clé API NVD) dans GitHub Actions. 4. Diagnostiquer un workflow défaillant à partir de ses journaux. 5. Corriger les dépendances vulnérables puis **retester**. --- ## 3. Architecture du projet ### 3.1 Application analysée Projet Maven multi-module `gestion-filieres-etudiants` (Spring Boot **4.1.1**, Java **17**) : | Module | Rôle | Port | |---|---|---| | `filieres-service` | CRUD des filières | `8081` | | `etudiants-service` | CRUD des étudiants, enrichis par appel REST à `filieres-service` | `8082` | Les deux services utilisent Spring Web MVC, Spring Data JPA, une base **H2** en mémoire et **springdoc-openapi** (Swagger UI). Le `pom.xml` parent importe le BOM `spring-boot-dependencies` ; il ne dérive pas de `spring-boot-starter-parent` (point important pour les corrections du [§ 8.2](#82-corrections-appliquées)). ### 3.2 Flux d'analyse SCA ```mermaid flowchart LR DEV["Développeur"] -->|"git push / pull request"| GH["Dépôt GitHub"] GH --> DC["Workflow
-SCA Dependency-Check"] GH --> TV["Workflow
-SCA Trivy"] MIR["diktamen/nvd-mirror
-(base NVD pré-construite)"] -->|"tar.gz + sha256"| DC NVD["API NVD (NIST)"] -->|"mise à jour incrémentale
-NVD_API_KEY"| DC TDB["Base Trivy
-(mirror.gcr.io)"] --> TV DC -->|"rapport HTML / JSON"| ART["Artefacts GitHub"] TV -->|"trivy-report.txt"| ART DBT["Dependabot"] -->|"pull requests de mise à jour"| GH ``` **Flux :** 1. Un push sur `main` déclenche les deux workflows ; une pull request vers `main` déclenche Dependency-Check. 2. **Dependency-Check** télécharge une base NVD déjà construite, la complète avec les CVE les plus récentes, puis analyse les dépendances Maven. 3. **Trivy** copie les jars des dépendances dans `target/libs` puis les analyse dans un conteneur `aquasec/trivy`. 4. Si une vulnérabilité dépasse le seuil (CVSS ≥ 7 pour Dependency-Check, HIGH/CRITICAL pour Trivy), le workflow échoue. 5. Les rapports sont publiés comme artefacts, que le workflow réussisse ou non. ### 3.3 Composants | Composant | Détail | Source | |---|---|---| | CI | GitHub Actions, runner `ubuntu-latest` | Workflows | | JDK | Temurin 17 (`actions/setup-java`, cache Maven) | Workflows | | Dependency-Check | `org.owasp:dependency-check-maven` **13.0.0** (12.1.0 au départ), seuil `failBuildOnCVSS = 7`, rapports HTML + JSON | `pom.xml` | | Base NVD | Archive `nvd-database.tar.gz` (~124 Mo, base H2 `odc.mv.db` ~250 Mo) publiée chaque nuit par `diktamen/nvd-mirror` | Journal du workflow | | Trivy | Image `aquasec/trivy:latest`, mode `rootfs`, `--severity HIGH,CRITICAL`, `--exit-code 1` | `trivy-sca.yml` | | Dependabot | Maven (quotidien, 3 répertoires) + GitHub Actions (hebdomadaire) | `.github/dependabot.yml` | --- ## 4. Environnement et prérequis | Élément | Usage | Version | |---|---|---| | Dépôt GitHub avec Actions activées | Exécution des workflows | — | | JDK | Build Maven | 17 (Temurin) | | Maven Wrapper (`mvnw`) | Build et plugin Dependency-Check | fourni dans le dépôt | | Docker (sur le runner) | Exécution de Trivy | préinstallé sur `ubuntu-latest` | | Clé API NVD | Mise à jour incrémentale de la base NVD | demandée sur https://nvd.nist.gov/developers/request-an-api-key | Pour reproduire en local : ```bash ./mvnw -B package # build ./mvnw -B org.owasp:dependency-check-maven:aggregate # Dependency-Check (long sans base locale) ./mvnw -B dependency:copy-dependencies -DoutputDirectory=target/libs docker run --rm -v "$PWD":/src aquasec/trivy:latest rootfs \ --scanners vuln --severity HIGH,CRITICAL /src # Trivy ``` --- ## 5. Configuration ### 5.1 Plugin Dependency-Check dans le `pom.xml` ```xml org.owasp dependency-check-maven 13.0.0 7 HTML JSON ``` - `failBuildOnCVSS = 7` : le build échoue dès qu'une dépendance a une CVE de score **≥ 7.0** (sévérité *High* ou *Critical*) ; - le goal **`aggregate`** analyse les deux modules en une seule passe et produit un rapport unique ; - la version **13.0.0** est imposée par la base pré-construite (un schéma de base différent ne serait pas lisible). ### 5.2 Secret `NVD_API_KEY` **Figure 1 — Secret `NVD_API_KEY` dans GitHub** ![Settings > Secrets and variables > Actions : secret NVD_API_KEY (valeur masquée)](docs/images/01-secret-nvd-api-key.png) *Explication :* la clé API NVD est stockée dans **Settings → Secrets and variables → Actions** et injectée dans le workflow par `${{ secrets.NVD_API_KEY }}`. GitHub masque sa valeur (`***`) dans les journaux. La clé n'apparaît jamais dans le code, dans le `pom.xml` ni dans ce document. Les pull requests ouvertes par Dependabot n'ont pas accès aux secrets *Actions* : le même secret doit être ajouté dans **Secrets and variables → Dependabot**. Le plugin lit la clé depuis une variable d'environnement (`-DnvdApiKeyEnvironmentVariable=NVD_API_KEY`), ce qui évite de la passer en clair sur la ligne de commande. ### 5.3 Dependabot ```yaml version: 2 updates: - package-ecosystem: maven directories: ["/", "/filieres-service", "/etudiants-service"] schedule: interval: daily - package-ecosystem: github-actions directory: "/" schedule: interval: weekly ``` **Figure 2 — Pull requests ouvertes par Dependabot** ![Liste des pull requests Dependabot : actions/checkout 4 vers 7, actions/setup-java 4 vers 6, actions/upload-artifact 4 vers 7, log4j-core 2.26.1, dependency-check-maven 13.0.0](docs/images/02-dependabot-pull-requests.png) *Explication :* Dependabot a proposé la montée de version des actions GitHub (`checkout` 4 → 7, `setup-java` 4 → 6, `upload-artifact` 4 → 7), de `log4j-core` (→ 2.26.1) et de `dependency-check-maven` (→ 13.0.0). Avant les corrections, les workflows de ces pull requests échouaient pour les mêmes raisons que sur `main` (voir [§ 6.1](#61-problème--téléchargement-complet-de-la-nvd-à-chaque-exécution)). --- ## 6. Workflow OWASP Dependency-Check ### 6.1 Problème : téléchargement complet de la NVD à chaque exécution *Constat :* toutes les exécutions #20 à #24 du workflow initial ont échoué, avec des durées de **35 min à 1 h 23**. Dependency-Check doit disposer d'une copie locale de la NVD (environ **412 000 CVE**). Sans clé API ni cache, chaque exécution la retéléchargeait entièrement par pages de 2 000 enregistrements. Deux causes d'échec distinctes ont été observées : | Exécution | Message | Nature | |---|---|---| | #21 | `NvdApiException: NVD Returned Status Code: 524` puis `NoDataException: No documents exist` | **Erreur d'outillage** : l'API NVD a expiré, aucune base n'a pu être construite, le code n'a pas été évalué | | #20 | `One or more dependencies were identified with vulnerabilities that have a CVSS score greater than or equal to '7.0'` | **Résultat de sécurité** : l'analyse a abouti (en 1 h 23) et a trouvé des vulnérabilités réelles (voir [§ 8.1](#81-vulnérabilités-détectées)) | **Extrait 1 — Échec technique : erreur 524 de l'API NVD (exécution #21, fin du journal)** ```text [WARNING] Unable to update 1 or more Cached Web DataSource, using local data instead. Results may not include recent vulnerabilities. [ERROR] Unable to continue dependency-check analysis. [ERROR] gestion-filieres-etudiants ......................... FAILURE [34:27 min] [ERROR] BUILD FAILURE [ERROR] Failed to execute goal org.owasp:dependency-check-maven:12.1.0:aggregate (default-cli) on project gestion-filieres-etudiants: Fatal exception(s) analyzing gestion-filieres-etudiants: One or more exceptions occurred during analysis: [ERROR] UpdateException: Error updating the NVD Data [ERROR] caused by NvdApiException: NVD Returned Status Code: 524 [ERROR] NoDataException: No documents exist ``` **Extrait 2 — Échec de sécurité : CVE détectées (exécution #20, fin du journal)** ```text [ERROR] gestion-filieres-etudiants ......................... FAILURE [ 01:23 h] [ERROR] BUILD FAILURE [ERROR] One or more dependencies were identified with vulnerabilities that have a CVSS score greater than or equal to '7.0': [ERROR] angus-activation-2.0.3.jar (pkg:maven/org.eclipse.angus/angus-activation@2.0.3, ...): CVE-2025-7962(6.0) [ERROR] log4j-core-2.14.1.jar (pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1, ...): CVE-2021-44832(6.6), CVE-2021-44228(10.0), CVE-2026-34480(6.9), CVE-2026-34481(6.3), CVE-2021-45046(9.0), CVE-2026-34479(6.9) [ERROR] tomcat-embed-core-11.0.24.jar (pkg:maven/org.apache.tomcat.embed/tomcat-embed-core@11.0.24, ...): CVE-2026-65183(8.1), CVE-2026-65905(9.8), CVE-2026-65927(7.5), CVE-2026-66422(8.1), CVE-2026-68763(7.5), CVE-2026-68525(9.1), CVE-2026-68569(8.1), CVE-2026-65182(9.1), CVE-2026-65637(9.8) ``` *Explication :* l'extrait 1 montre un **problème d'outillage** (la base n'a jamais pu être construite), l'extrait 2 un **résultat de sécurité** : l'analyse a abouti et le seuil `failBuildOnCVSS = 7` a été dépassé. ### 6.2 Première correction : cache et timeout Une première version a ajouté un cache `actions/cache` de la base NVD et un `timeout-minutes: 60`, puis la clé API a été configurée. **Figure 3 — Exécution annulée à 36 % du téléchargement** ![Journal : Downloaded 150,000/412,312 (36%), Retrying request, Error: The operation was canceled, Post Cache base NVD ignoré](docs/images/03-dependency-check-annule-timeout.png) *Explication :* même avec la clé API, l'API NVD ne fournit qu'environ **10 000 CVE toutes les 2 à 3 minutes**, avec de nombreuses relances (`Retrying request … 2nd/3rd/4th time`). Le timeout de 60 minutes a annulé le job à **36 %**. Surtout, l'étape *Post Cache* a été **ignorée** : `actions/cache` ne sauvegarde rien lorsque le job est annulé ou échoue. Chaque exécution recommençait donc à 0 %. Une deuxième version a séparé le téléchargement (`update-only`, timeout 300 min) et sauvegardé le cache explicitement (`actions/cache/save`) juste après. **Figure 4 — Téléchargement initial toujours en cours après plus de 3 heures** ![Étape Mettre a jour la base NVD en cours depuis 3 h 24 min](docs/images/04-dependency-check-3h-en-cours.png) *Explication :* la logique était correcte (le cache aurait été conservé), mais le **premier** téléchargement dépassait 3 heures. De plus, un cache créé sur une pull request n'est visible que par cette pull request, et GitHub supprime un cache inutilisé depuis 7 jours : ce coût initial se serait répété. Cette approche n'est pas viable pour un workflow exécuté à chaque pull request. ### 6.3 Solution retenue : base NVD pré-construite Plutôt que de construire la base dans notre CI, le workflow télécharge une base **déjà construite** et publiée chaque nuit par le dépôt public [`diktamen/nvd-mirror`](https://github.com/diktamen/nvd-mirror) (release `nvd-data-latest`). Ce dépôt exécute lui-même Dependency-Check 13.0.0 dans GitHub Actions et met à jour sa base de façon incrémentale. | | Avant | Après | |---|---|---| | Obtention de la base NVD | Téléchargement complet via l'API (412 000 CVE) | Archive de ~124 Mo téléchargée en **4 s** | | Intégrité | — | Vérification **SHA-256** (`nvd-database.tar.gz: OK`) | | CVE publiées depuis la génération du miroir | — | Mise à jour incrémentale avec `NVD_API_KEY` (quelques secondes) | | Durée totale du workflow | 35 min à plus de 3 h, ou échec | **≈ 30 s à 1 min** | **Figure 5 — Téléchargement et vérification de la base pré-construite** ![Journal : nvd-database.tar.gz: OK, odc.mv.db 251723776 octets](docs/images/05-telechargement-base-nvd-sha256.png) *Explication :* l'empreinte SHA-256 publiée avec l'archive est vérifiée avant extraction : une archive altérée ou tronquée fait échouer le workflow. Le fichier `odc.mv.db` (~250 Mo) est la base H2 utilisée par Dependency-Check. > **Vérification de la base.** Pour s'assurer que la base du miroir n'était pas vide, l'analyse a été relancée avec cette même base sur le code **d'origine** : elle a de nouveau détecté `log4j-core-2.14.1` (CVE-2021-44228, 10.0) et `tomcat-embed-core-11.0.24`. ### 6.4 Workflow final ```yaml name: SCA Dependency-Check on: push: branches: [main] pull_request: branches: [main] workflow_dispatch: env: NVD_MIRROR_URL: https://github.com/diktamen/nvd-mirror/releases/download/nvd-data-latest/nvd-database.tar.gz DC_DATA: ${{ github.workspace }}/dc-data jobs: sca: runs-on: ubuntu-latest timeout-minutes: 30 steps: - uses: actions/checkout@v4 - uses: actions/setup-java@v4 with: { distribution: temurin, java-version: '17', cache: maven } - name: Rendre mvnw exécutable run: chmod +x mvnw - name: Telecharger la base NVD pre-construite working-directory: ${{ runner.temp }} run: | curl -fsSL --retry 3 -o nvd-database.tar.gz "$NVD_MIRROR_URL" curl -fsSL --retry 3 -o nvd-database.tar.gz.sha256 "$NVD_MIRROR_URL.sha256" sha256sum -c nvd-database.tar.gz.sha256 tar -xzf nvd-database.tar.gz -C "$GITHUB_WORKSPACE" - name: Mise a jour incrementale NVD continue-on-error: true timeout-minutes: 10 env: NVD_API_KEY: ${{ secrets.NVD_API_KEY }} run: | if [ -z "$NVD_API_KEY" ]; then echo "::warning::Secret NVD_API_KEY absent : scan avec la base du miroir" exit 0 fi ./mvnw -B org.owasp:dependency-check-maven:update-only \ "-DdataDirectory=$DC_DATA" -DnvdApiKeyEnvironmentVariable=NVD_API_KEY - name: Dependency-Check run: | ./mvnw -B org.owasp:dependency-check-maven:aggregate \ "-DdataDirectory=$DC_DATA" -DautoUpdate=false - name: Upload report if: always() uses: actions/upload-artifact@v4 with: name: dependency-check-report path: '**/target/dependency-check-report.*' ``` | Étape | Rôle | |---|---| | Télécharger la base NVD pré-construite | Récupère et vérifie (SHA-256) la base du miroir | | Mise à jour incrémentale NVD | Ajoute les CVE publiées depuis la génération du miroir ; `continue-on-error` : une indisponibilité de l'API NVD ne bloque pas l'analyse | | Dependency-Check | Analyse les dépendances sans retélécharger (`autoUpdate=false`) ; échoue si CVSS ≥ 7 | | Upload report | Publie les rapports HTML et JSON, même en cas d'échec (`if: always()`) | **Figure 6 — Exécutions réussies du workflow final** ![Onglet Actions du dépôt : exécutions SCA Dependency-Check toutes vertes, chacune en 1 min environ, sur les pull requests Dependabot](docs/images/06-dependency-check-succes.png) *Explication :* avec la base pré-construite, chaque exécution de *SCA Dependency-Check* se termine en **1 min à 1 min 20 s**, y compris sur les pull requests ouvertes par Dependabot (montée de version de `jackson-bom`, `actions/checkout`, `actions/setup-java`…). Le job lui-même dure **30 s** sur `main`. Avant, aucune exécution n'aboutissait. **Figure 7 — Rapport HTML Dependency-Check** ![Rapport dependency-check-report.html : dependency-check 13.0.0, 100 dépendances (61 uniques), 2 dépendances vulnérables, 4 vulnérabilités de sévérité LOW dans DOMPurify 3.4.13](docs/images/07-rapport-dependency-check.png) *Explication :* le rapport (artefact `dependency-check-report`, fourni dans `dependency-check-report.zip`) indique **dependency-check 13.0.0**, **100 dépendances analysées (61 uniques)**, **2 dépendances vulnérables** et **4 vulnérabilités**, **0** supprimée. Il s'agit uniquement de `DOMPurify 3.4.13` embarqué dans `swagger-ui-5.32.14.jar` (fichiers `swagger-ui-bundle.js` et `swagger-ui-es-bundle.js`), de sévérité maximale **LOW** : le seuil de 7 n'est pas atteint, le workflow est vert (voir [§ 8.3](#83-retest)). --- ## 7. Workflow Trivy ### 7.1 Problème : un workflow vert qui n'analysait rien **Extrait 3 — Faux vert : aucun fichier analysé (SCA Trivy #20)** ```text INFO [vuln] Vulnerability scanning is enabled INFO Number of language-specific files num=0 WARN [report] Supported files for scanner(s) not found. scanners=[vuln] Report Summary ┌────────┬──────┬─────────────────┐ │ Target │ Type │ Vulnerabilities │ ├────────┼──────┼─────────────────┤ │ - │ - │ - │ └────────┴──────┴─────────────────┘ Legend: - '-': Not scanned - '0': Clean (no security findings detected) ``` *Explication :* le workflow initial était **vert** alors que `log4j-core 2.14.1` était présent. Le journal montre `Number of language-specific files num=0` et un rapport où toutes les cibles sont *Not scanned*. Deux raisons : - en mode **`fs`**, Trivy analyse les fichiers de dépendances (`pom.xml`) mais **pas les fichiers `.jar`** ; - l'option `--skip-files "**/pom.xml"` excluait justement le seul type de fichier que le mode `fs` sait lire. Un workflow vert qui n'a rien analysé est plus dangereux qu'un workflow rouge : il donne une **fausse assurance**. ### 7.2 Correction : mode `rootfs` Le mode **`rootfs`** analyse les artefacts installés, y compris les fichiers `.jar` copiés dans `target/libs` par `dependency:copy-dependencies`. Après correction, Trivy a analysé **242 cibles** et immédiatement détecté de nouvelles vulnérabilités dans **Jackson**, que la version `fs` ne pouvait pas voir. ### 7.3 Workflow final ```yaml - name: Télécharger les jars des dépendances run: | chmod +x mvnw ./mvnw -B dependency:copy-dependencies -DoutputDirectory=target/libs - name: Scan des dépendances (Trivy) run: | docker run --rm -v "$PWD":/src aquasec/trivy:latest rootfs \ --scanners vuln --severity HIGH,CRITICAL --exit-code 1 \ --output /src/trivy-report.txt /src ``` **Figure 8 — Exécution réussie de Trivy** ![GitHub Actions : job trivy réussi en 1 min 30 s ; Télécharger les jars 21 s, Scan des dépendances (Trivy) 1 min 1 s, Afficher le rapport, Upload report](docs/images/08-trivy-succes.png) *Explication :* le job **trivy** réussit en **1 min 30 s** : 21 s pour copier les jars, **1 min 1 s** pour l'analyse (dont le téléchargement de la base Trivy). Le rapport (étape *Afficher le rapport* et artefact `trivy-report`) liste les jars de `etudiants-service/target/libs` et `filieres-service/target/libs` (**242 cibles**), chacun avec **0** vulnérabilité HIGH ou CRITICAL. `--exit-code 1` garantit qu'une seule vulnérabilité de ce niveau aurait fait échouer le workflow. --- ## 8. Résultats et corrections ### 8.1 Vulnérabilités détectées | Composant | Version | Origine | Outil | Principales CVE (CVSS) | |---|---|---|---|---| | `log4j-core` | 2.14.1 | Dépendance directe de `filieres-service`, **non utilisée** dans le code | Dependency-Check | **CVE-2021-44228 (10.0, Log4Shell)**, CVE-2021-45046 (9.0), CVE-2021-44832 (6.6) | | `tomcat-embed-core` | 11.0.24 | Transitive (Spring Boot 4.1.1) | Dependency-Check | CVE-2026-65905 (9.8), CVE-2026-65637 (9.8), CVE-2026-68525 (9.1), CVE-2026-65182 (9.1) et 5 autres ≥ 7.5 | | `jackson-core` / `jackson-databind` | 2.21.5 et 3.1.5 | Transitives (Spring Boot 4.1.1) | **Trivy** | CVE-2026-89407 (HIGH), CVE-2026-68497, CVE-2026-89425, CVE-2026-91776, CVE-2026-91777 | | `angus-activation` | 2.0.3 | Transitive | Dependency-Check | CVE-2025-7962 (6.0), sous le seuil | ### 8.2 Corrections appliquées | Composant | Correction | Fichier | |---|---|---| | `log4j-core` 2.14.1 | **Supprimé** (aucun usage dans le code, la journalisation passe par Logback via Spring Boot) | `filieres-service/pom.xml` | | Tomcat | Forcé en **11.0.27** (`tomcat-embed-core`, `-el`, `-websocket`) | `pom.xml` | | Jackson | Forcé en **2.21.8** et **3.1.8** par import des BOM `com.fasterxml.jackson:jackson-bom` et `tools.jackson:jackson-bom` | `pom.xml` | > **Point technique.** Le projet importe le BOM Spring Boot au lieu d'hériter de `spring-boot-starter-parent`. Dans ce cas, redéfinir une propriété comme `` n'a **aucun effet** : la première tentative a laissé Tomcat en 11.0.24. Les versions corrigées doivent être déclarées dans `` **avant** l'import du BOM Spring Boot, car Maven retient la première déclaration rencontrée. ```xml com.fasterxml.jackson jackson-bom ${jackson-2.version} pom import tools.jackson jackson-bom ${jackson.version} pom import org.apache.tomcat.embed tomcat-embed-core ${tomcat.version} org.springframework.boot spring-boot-dependencies ${spring-boot.version} pom import ``` ### 8.3 Retest | Contrôle | Avant correction | Après correction | |---|---|---| | Dependency-Check (seuil CVSS 7) | **Échec** : log4j-core, tomcat-embed-core | **Succès** : seul DOMPurify (CVE-2026-109344, CVE-2026-109345, sévérité LOW) est signalé | | Trivy (HIGH/CRITICAL) | Faux vert, puis **8 jars** Jackson en HIGH | **Succès** : 242 cibles, **0** HIGH/CRITICAL | | `./mvnw package` | — | Succès | | Démarrage de `filieres-service` | — | Démarre avec **Apache Tomcat/11.0.27**, `GET /api/filieres` renvoie les données | **Figure 9 — Application démarrée avec les dépendances corrigées** ![Swagger UI de filieres-service sur http://localhost:8081 : Filieres Service API, endpoints GET/PUT/DELETE /api/filieres/{id}, GET/POST /api/filieres](docs/images/09-application-swagger.png) *Explication :* `filieres-service` démarre avec **Apache Tomcat/11.0.27** ; Swagger UI expose les cinq opérations CRUD de `/api/filieres`. Le forçage de versions de Tomcat et de Jackson n'a pas cassé l'application : le service démarre et l'API répond. Le projet ne contient pas de tests automatisés, ce contrôle reste donc manuel. ### 8.4 Comparaison des deux outils | Critère | Dependency-Check | Trivy | |---|---|---| | Base de vulnérabilités | NVD (NIST) | Base Trivy (avis GitHub, NVD…) | | Préparation de la base | ~412 000 CVE : plusieurs heures via l'API, **4 s** avec le miroir | ~129 Mo en **≈ 4 s** | | Durée totale du workflow (version finale) | ≈ 30 s à 1 min | ≈ 1 min 20 s | | log4j / Tomcat | Détectés | Non vus avant la correction du mode (`fs`) | | Jackson 2.21.5 / 3.1.5 | Non signalés au-dessus du seuil | **Détectés** (HIGH) avec version corrigée | | JavaScript embarqué dans un jar (DOMPurify) | **Détecté** | Non signalé | | Seuil bloquant | `failBuildOnCVSS = 7` | `--severity HIGH,CRITICAL --exit-code 1` | | Rapport | HTML + JSON (artefact) | Texte (artefact) | Aucun des deux outils n'a vu exactement les mêmes choses : les utiliser ensemble **réduit les angles morts**. --- ## 9. Limites et recommandations ### 9.1 Limites de la SCA - **Vulnérabilités connues uniquement** : un outil SCA ne trouve que les failles déjà publiées (CVE) ; une faille non divulguée (*zero-day*) passe inaperçue. - **Faux positifs** : la correspondance par CPE de Dependency-Check peut associer une CVE à un composant qui n'est pas réellement concerné. Chaque résultat demande une revue. - **Exploitabilité non évaluée** : une dépendance vulnérable n'est pas forcément exploitable dans le contexte de l'application (fonction vulnérable jamais appelée). - **Le code du projet n'est pas analysé** : c'est le rôle du SAST (workshop 1). ### 9.2 Limites propres à ce workshop - La base NVD provient d'un **miroir communautaire** (`diktamen/nvd-mirror`), non officiel OWASP. L'empreinte SHA-256 garantit l'intégrité du téléchargement, mais pas l'authenticité du contenu publié par ce dépôt. - La base du miroir est mise à jour **une fois par nuit** ; sans `NVD_API_KEY`, les CVE publiées depuis la dernière génération ne sont pas prises en compte. - L'analyseur **Sonatype OSS Index** est désactivé (identifiants manquants), ce qui retire une source de données à Dependency-Check. - L'image **`aquasec/trivy:latest`** est un tag mobile : le comportement de Trivy peut changer d'une exécution à l'autre. - Le workflow Trivy ne s'exécute pas sur les pull requests (`push` sur `main` et `workflow_dispatch` uniquement). - Les actions `checkout@v4`, `setup-java@v4` et `upload-artifact@v4` déclenchent un avertissement de dépréciation de Node.js 20. - Les CVE DOMPurify (dans Swagger UI, sévérité LOW) restent ouvertes car sous le seuil de 7. - Les corrections Tomcat et Jackson **forcent** des versions différentes de celles validées par Spring Boot 4.1.1 : il faudra les retirer lorsqu'une version de Spring Boot les intégrera. ### 9.3 Recommandations 1. **Ajouter `NVD_API_KEY`** dans les secrets *Actions* et *Dependabot* de chaque dépôt. 2. **Déclencher Trivy aussi sur les pull requests**, pour bloquer une dépendance vulnérable avant la fusion. 3. **Fixer une version précise** de l'image Trivy au lieu de `latest`. 4. **Fusionner les pull requests Dependabot** des actions GitHub une fois les workflows verts. 5. **Mettre à jour `springdoc-openapi`** dès qu'une version embarque un DOMPurify corrigé. 6. **Publier les rapports au format SARIF** dans l'onglet *Security* de GitHub (*code scanning*). 7. Pour un usage en entreprise, **héberger son propre miroir NVD** (outil `vulnz` ou workflow planifié) plutôt que de dépendre d'un dépôt tiers. 8. **Ajouter des tests automatisés** pour vérifier qu'une montée de version de dépendance ne casse pas l'application. --- ## 10. Conclusion Ce workshop a mis en place une chaîne **SCA** automatisée dans GitHub Actions avec deux outils complémentaires : **OWASP Dependency-Check**, adossé à la base NVD du NIST, et **Trivy**, complétés par **Dependabot** pour les mises à jour. Le diagnostic des journaux a révélé deux problèmes qui faussaient complètement les résultats initiaux : un workflow **Trivy vert qui n'analysait aucun fichier**, et un workflow **Dependency-Check qui ne terminait jamais** parce qu'il retéléchargeait la NVD entière (412 000 CVE) à chaque exécution. Le premier a été corrigé en passant Trivy en mode `rootfs` ; le second en utilisant une **base NVD pré-construite**, vérifiée par SHA-256 et complétée par une mise à jour incrémentale, ce qui ramène le workflow de plusieurs heures à **moins d'une minute**. Une fois les outils fiables, ils ont détecté des vulnérabilités réelles : **Log4Shell** (CVE-2021-44228, 10.0) dans une dépendance inutilisée, des failles critiques de **Tomcat** (jusqu'à 9.8) et des failles **Jackson** que seul Trivy a signalées. Les corrections (suppression de log4j, forçage de Tomcat 11.0.27 et Jackson 2.21.8 / 3.1.8) ont été **retestées** : les deux workflows sont verts et l'application démarre normalement. Un workflow vert ne garantit pas l'absence de vulnérabilité : il faut vérifier **ce qu'il a réellement analysé**, et compléter la SCA par le SAST et, à terme, par des tests dynamiques. --- ## 11. Références - OWASP Dependency-Check : https://owasp.org/www-project-dependency-check/ - Dependency-Check — plugin Maven : https://dependency-check.github.io/DependencyCheck/dependency-check-maven/ - Dependency-Check — miroir des données NVD : https://dependency-check.github.io/DependencyCheck/data/mirrornvd.html - Dependency-Check — issue « Very long time to download NVD data » : https://github.com/dependency-check/DependencyCheck/issues/8493 - Base NVD pré-construite `diktamen/nvd-mirror` : https://github.com/diktamen/nvd-mirror - NVD — demande de clé API : https://nvd.nist.gov/developers/request-an-api-key - Trivy — documentation : https://trivy.dev/ - Trivy — Java (jar en `rootfs` / `image`, `pom.xml` en `fs`) : https://trivy.dev/latest/docs/coverage/language/java/ - GitHub Actions — secrets : https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions - GitHub Actions — cache des dépendances : https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows - Dependabot — configuration : https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference - Maven — import de BOM et gestion des dépendances : https://maven.apache.org/guides/introduction/introduction-to-dependency-mechanism.html - CVE-2021-44228 (Log4Shell) : https://nvd.nist.gov/vuln/detail/CVE-2021-44228 
+# Workshop 3 — Analyse SCA avec OWASP Dependency-Check et Trivy
+
+**Intégration de l'analyse de composition logicielle (SCA) dans GitHub Actions**
+
+![OWASP Dependency-Check](https://img.shields.io/badge/OWASP-Dependency--Check-000000?logo=owasp&logoColor=white)
+![Trivy](https://img.shields.io/badge/Trivy-SCA-1904DA?logo=aquasecurity&logoColor=white)
+![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-CI-2088FF?logo=githubactions&logoColor=white)
+![Dependabot](https://img.shields.io/badge/Dependabot-mises%20%C3%A0%20jour-025E8C?logo=dependabot&logoColor=white)
+![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4.1.1-6DB33F?logo=springboot&logoColor=white)
+![Java](https://img.shields.io/badge/Java-17-ED8B00?logo=openjdk&logoColor=white)
+![Maven](https://img.shields.io/badge/Maven-multi--module-C71A36?logo=apachemaven&logoColor=white)
+![NVD](https://img.shields.io/badge/NIST-NVD-005EA2)
+
+## Présentation académique
+
+| | |
+|---|---|
+| **Département** | Département Informatique |
+| **Programme** | Master DevOps & Cloud Computing |
+| **Workshop** | Workshop 3 — Analyse SCA avec OWASP Dependency-Check et Trivy |
+| **Réalisé par** | LAZRAG Khalid · ERAOUI Anass · BOUTEFAH KHATIB Fatima Zohra |
+| **Responsable** | Pr. KOUISSI Mohamed |
+
+## Résumé
+
+Ce workshop met en place une chaîne d'analyse de composition logicielle (**SCA**) sur un projet **Spring Boot / Maven** composé de deux microservices :
+
+- à chaque `push` sur `main` (et à chaque pull request pour Dependency-Check), **GitHub Actions** analyse les **dépendances** avec **OWASP Dependency-Check** (base **NVD** du NIST) et **Trivy** (base Aqua Security) ;
+- les rapports sont publiés comme artefacts ;
+- le workflow **échoue** lorsqu'une vulnérabilité grave est trouvée ;
+- **Dependabot** propose en parallèle les mises à jour de dépendances et d'actions GitHub.
+
+**À la lecture de ce document, vous saurez :**
+
+- ce qu'est la SCA et en quoi elle complète le SAST du workshop 1 ;
+- ce que Dependency-Check, Trivy et Dependabot détectent, et en quoi ils se complètent ;
+- comment les deux workflows GitHub Actions sont construits ;
+- quels problèmes ont été rencontrés (faux vert de Trivy, téléchargement NVD de plusieurs heures) et comment ils ont été résolus ;
+- quelles vulnérabilités ont été trouvées, corrigées et retestées, et quelles sont les limites de l'approche.
+
+> **Note sur les preuves.** Les chiffres de ce document proviennent des journaux réels des workflows GitHub Actions (dépôts `sanotogii/workshop3-Groupe1` et `anasseraoui-oss/Workchop3-Groupe1`) et des captures du dossier `docs/images/`. Lorsqu'aucune capture n'est disponible, le document cite un **extrait de journal** recopié tel quel depuis GitHub Actions. Les identifiants CVE sont ceux affichés par les outils au moment de l'exécution. Le rapport complet de Dependency-Check est fourni dans `dependency-check-report.zip`.
+
+## Table des matières
+
+1. [Introduction et objectifs](#1-introduction-et-objectifs)
+2. [Architecture du projet](#2-architecture-du-projet)
+3. [Environnement et prérequis](#3-environnement-et-prérequis)
+4. [Configuration](#4-configuration)
+5. [Workflow OWASP Dependency-Check](#5-workflow-owasp-dependency-check)
+6. [Workflow Trivy](#6-workflow-trivy)
+7. [Résultats et corrections](#7-résultats-et-corrections)
+8. [Limites et recommandations](#8-limites-et-recommandations)
+9. [Conclusion](#9-conclusion)
+10. [Références](#10-références)
+
+---
+
+## 1. Introduction et objectifs
+
+### 1.1 Qu'est-ce que la SCA ?
+
+La **SCA** (*Software Composition Analysis*) consiste à inventorier les **bibliothèques tierces** utilisées par une application (dépendances directes et transitives), puis à comparer chaque composant et sa version à des bases de vulnérabilités connues (**CVE**).
+
+Elle répond à la question : *« est-ce que j'embarque un composant dont une faille est déjà publique ? »*
+
+### 1.2 Pourquoi la SCA en plus du SAST ?
+
+Le SAST (workshop 1) analyse **le code écrit par l'équipe**. Or une application Spring Boot moderne embarque plusieurs dizaines de bibliothèques dont le code n'est pas relu par l'équipe : ici **100 dépendances, dont 61 uniques**, analysées par Dependency-Check, et **242 fichiers jar** analysés par Trivy.
+
+Une faille comme **Log4Shell** (CVE-2021-44228) se trouve dans une bibliothèque, pas dans le code du projet : aucun outil SAST ne la signale, alors qu'un outil SCA la détecte immédiatement à partir du nom et de la version du composant.
+
+### 1.3 Rôle de chaque outil
+
+| Outil | Rôle dans le workshop | Ce qu'il apporte |
+|---|---|---|
+| **OWASP Dependency-Check** | Plugin Maven qui identifie les composants (CPE, Package URL) et les compare à la base **NVD** du NIST | Rapport HTML/JSON détaillé, score **CVSS**, seuil d'échec configurable (`failBuildOnCVSS`) |
+| **Trivy** | Scanner d'Aqua Security exécuté en conteneur Docker sur les jars du projet | Base de vulnérabilités propre (GitHub Advisory, NVD…), téléchargée en quelques secondes, indique la **version corrigée** |
+| **Dependabot** | Service GitHub qui surveille les manifestes (`pom.xml`, workflows) | Ouvre automatiquement des pull requests de mise à jour |
+| **GitHub Actions** | Orchestrateur CI | Exécution à chaque push / pull request, artefacts, secrets |
+
+### 1.4 Complémentarité Dependency-Check / Trivy
+
+Les deux outils n'utilisent ni la même base ni la même méthode d'identification :
+
+- **Dependency-Check** s'appuie sur la NVD et sur une correspondance par **CPE**. Cela peut produire des faux positifs, mais couvre aussi des fichiers JavaScript embarqués dans des jars.
+- **Trivy** s'appuie principalement sur les **avis de sécurité par écosystème** (Maven) et fournit la version qui corrige chaque faille.
+
+Ce workshop en donne un exemple concret : les failles **Jackson** ont été signalées par Trivy, et la faille **DOMPurify** embarquée dans `swagger-ui` uniquement par Dependency-Check (voir [§ 7.4](#74-comparaison-des-deux-outils)).
+
+### 1.5 Objectifs pédagogiques
+
+1. Intégrer Dependency-Check et Trivy dans des workflows GitHub Actions.
+2. Faire échouer la CI lorsqu'une dépendance présente une vulnérabilité grave.
+3. Gérer correctement un secret (clé API NVD) dans GitHub Actions.
+4. Diagnostiquer un workflow défaillant à partir de ses journaux.
+5. Corriger les dépendances vulnérables puis **retester**.
+
+---
+
+## 2. Architecture du projet
+
+### 2.1 Application analysée
+
+Projet Maven multi-module `gestion-filieres-etudiants` (Spring Boot **4.1.1**, Java **17**) :
+
+| Module | Rôle | Port |
+|---|---|---|
+| `filieres-service` | CRUD des filières | `8081` |
+| `etudiants-service` | CRUD des étudiants, enrichis par appel REST à `filieres-service` | `8082` |
+
+Les deux services utilisent Spring Web MVC, Spring Data JPA, une base **H2** en mémoire et **springdoc-openapi** (Swagger UI).
+
+Le `pom.xml` parent importe le BOM `spring-boot-dependencies` ; il ne dérive pas de `spring-boot-starter-parent` (point important pour les corrections du [§ 7.2](#72-corrections-appliquées)).
+
+### 2.2 Flux d'analyse SCA
+
+```mermaid
+flowchart LR
+    DEV["Développeur"] -->|"git push / pull request"| GH["Dépôt GitHub"]
+    GH --> DC["Workflow<br/>SCA Dependency-Check"]
+    GH --> TV["Workflow<br/>SCA Trivy"]
+    MIR["diktamen/nvd-mirror<br/>(base NVD pré-construite)"] -->|"tar.gz + sha256"| DC
+    NVD["API NVD (NIST)"] -->|"mise à jour incrémentale<br/>NVD_API_KEY"| DC
+    TDB["Base Trivy<br/>(mirror.gcr.io)"] --> TV
+    DC -->|"rapport HTML / JSON"| ART["Artefacts GitHub"]
+    TV -->|"trivy-report.txt"| ART
+    DBT["Dependabot"] -->|"pull requests de mise à jour"| GH
+```
+
+**Déroulement :**
+
+1. Un push sur `main` déclenche les deux workflows ; une pull request vers `main` déclenche Dependency-Check.
+2. **Dependency-Check** télécharge une base NVD déjà construite, la complète avec les CVE les plus récentes, puis analyse les dépendances Maven.
+3. **Trivy** copie les jars des dépendances dans `target/libs`, puis les analyse dans un conteneur `aquasec/trivy`.
+4. Si une vulnérabilité dépasse le seuil (CVSS ≥ 7 pour Dependency-Check, HIGH/CRITICAL pour Trivy), le workflow échoue.
+5. Les rapports sont publiés comme artefacts, que le workflow réussisse ou non.
+
+### 2.3 Composants
+
+| Composant | Détail | Source |
+|---|---|---|
+| CI | GitHub Actions, runner `ubuntu-latest` | Workflows |
+| JDK | Temurin 17 (`actions/setup-java`, cache Maven) | Workflows |
+| Dependency-Check | `org.owasp:dependency-check-maven` **13.0.0** (12.1.0 au départ), seuil `failBuildOnCVSS = 7`, rapports HTML + JSON | `pom.xml` |
+| Base NVD | Archive `nvd-database.tar.gz` (~124 Mo, base H2 `odc.mv.db` ~250 Mo) publiée chaque nuit par `diktamen/nvd-mirror` | Journal du workflow |
+| Trivy | Image `aquasec/trivy:latest`, mode `rootfs`, `--severity HIGH,CRITICAL`, `--exit-code 1` | `trivy-sca.yml` |
+| Dependabot | Maven (quotidien, 3 répertoires) + GitHub Actions (hebdomadaire) | `.github/dependabot.yml` |
+
+---
+
+## 3. Environnement et prérequis
+
+| Élément | Usage | Version |
+|---|---|---|
+| Dépôt GitHub avec Actions activées | Exécution des workflows | — |
+| JDK | Build Maven | 17 (Temurin) |
+| Maven Wrapper (`mvnw`) | Build et plugin Dependency-Check | fourni dans le dépôt |
+| Docker (sur le runner) | Exécution de Trivy | préinstallé sur `ubuntu-latest` |
+| Clé API NVD | Mise à jour incrémentale de la base NVD | à demander sur https://nvd.nist.gov/developers/request-an-api-key |
+
+**Reproduction en local :**
+
+```bash
+# Build
+./mvnw -B package
+
+# Dependency-Check (long sans base locale)
+./mvnw -B org.owasp:dependency-check-maven:aggregate
+
+# Trivy
+./mvnw -B dependency:copy-dependencies -DoutputDirectory=target/libs
+docker run --rm -v "$PWD":/src aquasec/trivy:latest rootfs \
+  --scanners vuln --severity HIGH,CRITICAL /src
+```
+
+---
+
+## 4. Configuration
+
+### 4.1 Plugin Dependency-Check dans le `pom.xml`
+
+```xml
+<plugin>
+  <groupId>org.owasp</groupId>
+  <artifactId>dependency-check-maven</artifactId>
+  <version>13.0.0</version>
+  <configuration>
+    <failBuildOnCVSS>7</failBuildOnCVSS>
+    <formats>
+      <format>HTML</format>
+      <format>JSON</format>
+    </formats>
+  </configuration>
+</plugin>
+```
+
+- `failBuildOnCVSS = 7` : le build échoue dès qu'une dépendance a une CVE de score **≥ 7.0** (sévérité *High* ou *Critical*) ;
+- le goal **`aggregate`** analyse les deux modules en une seule passe et produit un rapport unique ;
+- la version **13.0.0** est imposée par la base pré-construite (un schéma de base différent ne serait pas lisible).
+
+### 4.2 Secret `NVD_API_KEY`
+
+**Figure 1 — Secret `NVD_API_KEY` dans GitHub**
+
+![Settings > Secrets and variables > Actions : secret NVD_API_KEY (valeur masquée)](docs/images/01-secret-nvd-api-key.png)
+
+*Explication :* la clé API NVD est stockée dans **Settings → Secrets and variables → Actions** et injectée dans le workflow par `${{ secrets.NVD_API_KEY }}`. GitHub masque sa valeur (`***`) dans les journaux. La clé n'apparaît jamais dans le code, dans le `pom.xml` ni dans ce document.
+
+Les pull requests ouvertes par Dependabot n'ont pas accès aux secrets *Actions* : le même secret doit être ajouté dans **Secrets and variables → Dependabot**.
+
+Le plugin lit la clé depuis une variable d'environnement (`-DnvdApiKeyEnvironmentVariable=NVD_API_KEY`), ce qui évite de la passer en clair sur la ligne de commande.
+
+### 4.3 Dependabot
+
+```yaml
+version: 2
+updates:
+  - package-ecosystem: maven
+    directories: ["/", "/filieres-service", "/etudiants-service"]
+    schedule:
+      interval: daily
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+```
+
+**Figure 2 — Pull requests ouvertes par Dependabot**
+
+![Liste des pull requests Dependabot : actions/checkout 4 vers 7, actions/setup-java 4 vers 6, actions/upload-artifact 4 vers 7, log4j-core 2.26.1, dependency-check-maven 13.0.0](docs/images/02-dependabot-pull-requests.png)
+
+*Explication :* Dependabot a proposé la montée de version des actions GitHub (`checkout` 4 → 7, `setup-java` 4 → 6, `upload-artifact` 4 → 7), de `log4j-core` (→ 2.26.1) et de `dependency-check-maven` (→ 13.0.0). Avant les corrections, les workflows de ces pull requests échouaient pour les mêmes raisons que sur `main` (voir [§ 5.1](#51-problème--téléchargement-complet-de-la-nvd-à-chaque-exécution)).
+
+---
+
+## 5. Workflow OWASP Dependency-Check
+
+### 5.1 Problème : téléchargement complet de la NVD à chaque exécution
+
+*Constat :* toutes les exécutions #20 à #24 du workflow initial ont échoué, avec des durées de **35 min à 1 h 23**.
+
+Dependency-Check doit disposer d'une copie locale de la NVD (environ **412 000 CVE**). Sans clé API ni cache, chaque exécution la retéléchargeait entièrement par pages de 2 000 enregistrements.
+
+Deux causes d'échec distinctes ont été observées :
+
+| Exécution | Message | Nature |
+|---|---|---|
+| #21 | `NvdApiException: NVD Returned Status Code: 524` puis `NoDataException: No documents exist` | **Erreur d'outillage** : l'API NVD a expiré, aucune base n'a pu être construite, le code n'a pas été évalué |
+| #20 | `One or more dependencies were identified with vulnerabilities that have a CVSS score greater than or equal to '7.0'` | **Résultat de sécurité** : l'analyse a abouti (en 1 h 23) et a trouvé des vulnérabilités réelles (voir [§ 7.1](#71-vulnérabilités-détectées)) |
+
+**Extrait 1 — Échec technique : erreur 524 de l'API NVD (exécution #21, fin du journal)**
+
+```text
+[WARNING] Unable to update 1 or more Cached Web DataSource, using local data instead. Results may not include recent vulnerabilities.
+[ERROR] Unable to continue dependency-check analysis.
+[ERROR] gestion-filieres-etudiants ......................... FAILURE [34:27 min]
+[ERROR] BUILD FAILURE
+[ERROR] Failed to execute goal org.owasp:dependency-check-maven:12.1.0:aggregate (default-cli) on project gestion-filieres-etudiants: Fatal exception(s) analyzing gestion-filieres-etudiants: One or more exceptions occurred during analysis:
+[ERROR] UpdateException: Error updating the NVD Data
+[ERROR] caused by NvdApiException: NVD Returned Status Code: 524
+[ERROR] NoDataException: No documents exist
+```
+
+**Extrait 2 — Échec de sécurité : CVE détectées (exécution #20, fin du journal)**
+
+```text
+[ERROR] gestion-filieres-etudiants ......................... FAILURE [ 01:23 h]
+[ERROR] BUILD FAILURE
+[ERROR] One or more dependencies were identified with vulnerabilities that have a CVSS score greater than or equal to '7.0':
+[ERROR] angus-activation-2.0.3.jar (pkg:maven/org.eclipse.angus/angus-activation@2.0.3, ...): CVE-2025-7962(6.0)
+[ERROR] log4j-core-2.14.1.jar (pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1, ...): CVE-2021-44832(6.6), CVE-2021-44228(10.0), CVE-2026-34480(6.9), CVE-2026-34481(6.3), CVE-2021-45046(9.0), CVE-2026-34479(6.9)
+[ERROR] tomcat-embed-core-11.0.24.jar (pkg:maven/org.apache.tomcat.embed/tomcat-embed-core@11.0.24, ...): CVE-2026-65183(8.1), CVE-2026-65905(9.8), CVE-2026-65927(7.5), CVE-2026-66422(8.1), CVE-2026-68763(7.5), CVE-2026-68525(9.1), CVE-2026-68569(8.1), CVE-2026-65182(9.1), CVE-2026-65637(9.8)
+```
+
+*Explication :* l'extrait 1 montre un **problème d'outillage** (la base n'a jamais pu être construite), l'extrait 2 un **résultat de sécurité** : l'analyse a abouti et le seuil `failBuildOnCVSS = 7` a été dépassé.
+
+### 5.2 Première correction : cache et timeout
+
+Une première version a ajouté un cache `actions/cache` de la base NVD et un `timeout-minutes: 60`, puis la clé API a été configurée.
+
+**Figure 3 — Exécution annulée à 36 % du téléchargement**
+
+![Journal : Downloaded 150,000/412,312 (36%), Retrying request, Error: The operation was canceled, Post Cache base NVD ignoré](docs/images/03-dependency-check-annule-timeout.png)
+
+*Explication :* même avec la clé API, l'API NVD ne fournit qu'environ **10 000 CVE toutes les 2 à 3 minutes**, avec de nombreuses relances (`Retrying request … 2nd/3rd/4th time`). Le timeout de 60 minutes a annulé le job à **36 %**.
+
+Surtout, l'étape *Post Cache* a été **ignorée** : `actions/cache` ne sauvegarde rien lorsque le job est annulé ou échoue. Chaque exécution recommençait donc à 0 %.
+
+Une deuxième version a séparé le téléchargement (`update-only`, timeout 300 min) et sauvegardé le cache explicitement (`actions/cache/save`) juste après.
+
+**Figure 4 — Téléchargement initial toujours en cours après plus de 3 heures**
+
+![Étape Mettre a jour la base NVD en cours depuis 3 h 24 min](docs/images/04-dependency-check-3h-en-cours.png)
+
+*Explication :* la logique était correcte (le cache aurait été conservé), mais le **premier** téléchargement dépassait 3 heures. De plus, un cache créé sur une pull request n'est visible que par cette pull request, et GitHub supprime un cache inutilisé depuis 7 jours : ce coût initial se serait répété. Cette approche n'est pas viable pour un workflow exécuté à chaque pull request.
+
+### 5.3 Solution retenue : base NVD pré-construite
+
+Plutôt que de construire la base dans notre CI, le workflow télécharge une base **déjà construite** et publiée chaque nuit par le dépôt public [`diktamen/nvd-mirror`](https://github.com/diktamen/nvd-mirror) (release `nvd-data-latest`). Ce dépôt exécute lui-même Dependency-Check 13.0.0 dans GitHub Actions et met à jour sa base de façon incrémentale.
+
+| | Avant | Après |
+|---|---|---|
+| Obtention de la base NVD | Téléchargement complet via l'API (412 000 CVE) | Archive de ~124 Mo téléchargée en **4 s** |
+| Intégrité | — | Vérification **SHA-256** (`nvd-database.tar.gz: OK`) |
+| CVE publiées depuis la génération du miroir | — | Mise à jour incrémentale avec `NVD_API_KEY` (quelques secondes) |
+| Durée totale du workflow | 35 min à plus de 3 h, ou échec | **≈ 30 s à 1 min** |
+
+**Figure 5 — Téléchargement et vérification de la base pré-construite**
+
+![Journal : nvd-database.tar.gz: OK, odc.mv.db 251723776 octets](docs/images/05-telechargement-base-nvd-sha256.png)
+
+*Explication :* l'empreinte SHA-256 publiée avec l'archive est vérifiée avant extraction : une archive altérée ou tronquée fait échouer le workflow. Le fichier `odc.mv.db` (~250 Mo) est la base H2 utilisée par Dependency-Check.
+
+> **Vérification de la base.** Pour s'assurer que la base du miroir n'était pas vide, l'analyse a été relancée avec cette même base sur le code **d'origine** : elle a de nouveau détecté `log4j-core-2.14.1` (CVE-2021-44228, 10.0) et `tomcat-embed-core-11.0.24`.
+
+### 5.4 Workflow final
+
+```yaml
+name: SCA Dependency-Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  NVD_MIRROR_URL: https://github.com/diktamen/nvd-mirror/releases/download/nvd-data-latest/nvd-database.tar.gz
+  DC_DATA: ${{ github.workspace }}/dc-data
+
+jobs:
+  sca:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17', cache: maven }
+
+      - name: Rendre mvnw exécutable
+        run: chmod +x mvnw
+
+      - name: Telecharger la base NVD pre-construite
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -fsSL --retry 3 -o nvd-database.tar.gz "$NVD_MIRROR_URL"
+          curl -fsSL --retry 3 -o nvd-database.tar.gz.sha256 "$NVD_MIRROR_URL.sha256"
+          sha256sum -c nvd-database.tar.gz.sha256
+          tar -xzf nvd-database.tar.gz -C "$GITHUB_WORKSPACE"
+
+      - name: Mise a jour incrementale NVD
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          if [ -z "$NVD_API_KEY" ]; then
+            echo "::warning::Secret NVD_API_KEY absent : scan avec la base du miroir"
+            exit 0
+          fi
+          ./mvnw -B org.owasp:dependency-check-maven:update-only \
+            "-DdataDirectory=$DC_DATA" -DnvdApiKeyEnvironmentVariable=NVD_API_KEY
+
+      - name: Dependency-Check
+        run: |
+          ./mvnw -B org.owasp:dependency-check-maven:aggregate \
+            "-DdataDirectory=$DC_DATA" -DautoUpdate=false
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: '**/target/dependency-check-report.*'
+```
+
+| Étape | Rôle |
+|---|---|
+| Télécharger la base NVD pré-construite | Récupère et vérifie (SHA-256) la base du miroir |
+| Mise à jour incrémentale NVD | Ajoute les CVE publiées depuis la génération du miroir ; `continue-on-error` : une indisponibilité de l'API NVD ne bloque pas l'analyse |
+| Dependency-Check | Analyse les dépendances sans retélécharger (`autoUpdate=false`) ; échoue si CVSS ≥ 7 |
+| Upload report | Publie les rapports HTML et JSON, même en cas d'échec (`if: always()`) |
+
+**Figure 6 — Exécutions réussies du workflow final**
+
+![Onglet Actions du dépôt : exécutions SCA Dependency-Check toutes vertes, chacune en 1 min environ, sur les pull requests Dependabot](docs/images/06-dependency-check-succes.png)
+
+*Explication :* avec la base pré-construite, chaque exécution de *SCA Dependency-Check* se termine en **1 min à 1 min 20 s**, y compris sur les pull requests ouvertes par Dependabot (montée de version de `jackson-bom`, `actions/checkout`, `actions/setup-java`…). Le job lui-même dure **30 s** sur `main`. Avant, aucune exécution n'aboutissait.
+
+**Figure 7 — Rapport HTML Dependency-Check**
+
+![Rapport dependency-check-report.html : dependency-check 13.0.0, 100 dépendances (61 uniques), 2 dépendances vulnérables, 4 vulnérabilités de sévérité LOW dans DOMPurify 3.4.13](docs/images/07-rapport-dependency-check.png)
+
+*Explication :* le rapport (artefact `dependency-check-report`, fourni dans `dependency-check-report.zip`) indique **dependency-check 13.0.0**, **100 dépendances analysées (61 uniques)**, **2 dépendances vulnérables** et **4 vulnérabilités**, **0** supprimée.
+
+Il s'agit uniquement de `DOMPurify 3.4.13` embarqué dans `swagger-ui-5.32.14.jar` (fichiers `swagger-ui-bundle.js` et `swagger-ui-es-bundle.js`), de sévérité maximale **LOW** : le seuil de 7 n'est pas atteint, le workflow est vert (voir [§ 7.3](#73-retest)).
+
+---
+
+## 6. Workflow Trivy
+
+### 6.1 Problème : un workflow vert qui n'analysait rien
+
+**Extrait 3 — Faux vert : aucun fichier analysé (SCA Trivy #20)**
+
+```text
+INFO [vuln] Vulnerability scanning is enabled
+INFO Number of language-specific files num=0
+WARN [report] Supported files for scanner(s) not found. scanners=[vuln]
+
+Report Summary
+┌────────┬──────┬─────────────────┐
+│ Target │ Type │ Vulnerabilities │
+├────────┼──────┼─────────────────┤
+│   -    │  -   │        -        │
+└────────┴──────┴─────────────────┘
+Legend:
+- '-': Not scanned
+- '0': Clean (no security findings detected)
+```
+
+*Explication :* le workflow initial était **vert** alors que `log4j-core 2.14.1` était présent. Le journal montre `Number of language-specific files num=0` et un rapport où toutes les cibles sont *Not scanned*. Deux raisons :
+
+- en mode **`fs`**, Trivy analyse les fichiers de dépendances (`pom.xml`) mais **pas les fichiers `.jar`** ;
+- l'option `--skip-files "**/pom.xml"` excluait justement le seul type de fichier que le mode `fs` sait lire.
+
+Un workflow vert qui n'a rien analysé est plus dangereux qu'un workflow rouge : il donne une **fausse assurance**.
+
+### 6.2 Correction : mode `rootfs`
+
+Le mode **`rootfs`** analyse les artefacts installés, y compris les fichiers `.jar` copiés dans `target/libs` par `dependency:copy-dependencies`.
+
+Après correction, Trivy a analysé **242 cibles** et immédiatement détecté de nouvelles vulnérabilités dans **Jackson**, que la version `fs` ne pouvait pas voir.
+
+### 6.3 Workflow final
+
+```yaml
+- name: Télécharger les jars des dépendances
+  run: |
+    chmod +x mvnw
+    ./mvnw -B dependency:copy-dependencies -DoutputDirectory=target/libs
+
+- name: Scan des dépendances (Trivy)
+  run: |
+    docker run --rm -v "$PWD":/src aquasec/trivy:latest rootfs \
+      --scanners vuln --severity HIGH,CRITICAL --exit-code 1 \
+      --output /src/trivy-report.txt /src
+```
+
+**Figure 8 — Exécution réussie de Trivy**
+
+![GitHub Actions : job trivy réussi en 1 min 30 s ; Télécharger les jars 21 s, Scan des dépendances (Trivy) 1 min 1 s, Afficher le rapport, Upload report](docs/images/08-trivy-succes.png)
+
+*Explication :* le job **trivy** réussit en **1 min 30 s** : 21 s pour copier les jars, **1 min 1 s** pour l'analyse (dont le téléchargement de la base Trivy).
+
+Le rapport (étape *Afficher le rapport* et artefact `trivy-report`) liste les jars de `etudiants-service/target/libs` et `filieres-service/target/libs` (**242 cibles**), chacun avec **0** vulnérabilité HIGH ou CRITICAL. `--exit-code 1` garantit qu'une seule vulnérabilité de ce niveau aurait fait échouer le workflow.
+
+---
+
+## 7. Résultats et corrections
+
+### 7.1 Vulnérabilités détectées
+
+| Composant | Version | Origine | Outil | Principales CVE (CVSS) |
+|---|---|---|---|---|
+| `log4j-core` | 2.14.1 | Dépendance directe de `filieres-service`, **non utilisée** dans le code | Dependency-Check | **CVE-2021-44228 (10.0, Log4Shell)**, CVE-2021-45046 (9.0), CVE-2021-44832 (6.6) |
+| `tomcat-embed-core` | 11.0.24 | Transitive (Spring Boot 4.1.1) | Dependency-Check | CVE-2026-65905 (9.8), CVE-2026-65637 (9.8), CVE-2026-68525 (9.1), CVE-2026-65182 (9.1) et 5 autres ≥ 7.5 |
+| `jackson-core` / `jackson-databind` | 2.21.5 et 3.1.5 | Transitives (Spring Boot 4.1.1) | **Trivy** | CVE-2026-89407 (HIGH), CVE-2026-68497, CVE-2026-89425, CVE-2026-91776, CVE-2026-91777 |
+| `angus-activation` | 2.0.3 | Transitive | Dependency-Check | CVE-2025-7962 (6.0), sous le seuil |
+
+### 7.2 Corrections appliquées
+
+| Composant | Correction | Fichier |
+|---|---|---|
+| `log4j-core` 2.14.1 | **Supprimé** (aucun usage dans le code, la journalisation passe par Logback via Spring Boot) | `filieres-service/pom.xml` |
+| Tomcat | Forcé en **11.0.27** (`tomcat-embed-core`, `-el`, `-websocket`) | `pom.xml` |
+| Jackson | Forcé en **2.21.8** et **3.1.8** par import des BOM `com.fasterxml.jackson:jackson-bom` et `tools.jackson:jackson-bom` | `pom.xml` |
+
+> **Point technique.** Le projet importe le BOM Spring Boot au lieu d'hériter de `spring-boot-starter-parent`. Dans ce cas, redéfinir une propriété comme `<tomcat.version>` **n'a aucun effet** : la première tentative a laissé Tomcat en 11.0.24. Les versions corrigées doivent être déclarées dans `<dependencyManagement>` **avant** l'import du BOM Spring Boot, car Maven retient la première déclaration rencontrée.
+
+```xml
+<dependencyManagement>
+  <dependencies>
+    <!-- Jackson corrigé : déclaré AVANT le BOM Spring Boot -->
+    <dependency>
+      <groupId>com.fasterxml.jackson</groupId>
+      <artifactId>jackson-bom</artifactId>
+      <version>${jackson-2.version}</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+    <dependency>
+      <groupId>tools.jackson</groupId>
+      <artifactId>jackson-bom</artifactId>
+      <version>${jackson.version}</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+
+    <!-- Tomcat corrigé -->
+    <dependency>
+      <groupId>org.apache.tomcat.embed</groupId>
+      <artifactId>tomcat-embed-core</artifactId>
+      <version>${tomcat.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.tomcat.embed</groupId>
+      <artifactId>tomcat-embed-el</artifactId>
+      <version>${tomcat.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.tomcat.embed</groupId>
+      <artifactId>tomcat-embed-websocket</artifactId>
+      <version>${tomcat.version}</version>
+    </dependency>
+
+    <!-- BOM Spring Boot -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-dependencies</artifactId>
+      <version>${spring-boot.version}</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+```
+
+### 7.3 Retest
+
+| Contrôle | Avant correction | Après correction |
+|---|---|---|
+| Dependency-Check (seuil CVSS 7) | **Échec** : log4j-core, tomcat-embed-core | **Succès** : seul DOMPurify (CVE-2026-109344, CVE-2026-109345, sévérité LOW) est signalé |
+| Trivy (HIGH/CRITICAL) | Faux vert, puis **8 jars** Jackson en HIGH | **Succès** : 242 cibles, **0** HIGH/CRITICAL |
+| `./mvnw package` | — | Succès |
+| Démarrage de `filieres-service` | — | Démarre avec **Apache Tomcat/11.0.27**, `GET /api/filieres` renvoie les données |
+
+**Figure 9 — Application démarrée avec les dépendances corrigées**
+
+![Swagger UI de filieres-service sur http://localhost:8081 : Filieres Service API, endpoints GET/PUT/DELETE /api/filieres/{id}, GET/POST /api/filieres](docs/images/09-application-swagger.png)
+
+*Explication :* `filieres-service` démarre avec **Apache Tomcat/11.0.27** ; Swagger UI expose les cinq opérations CRUD de `/api/filieres`. Le forçage de versions de Tomcat et de Jackson n'a pas cassé l'application : le service démarre et l'API répond. Le projet ne contient pas de tests automatisés, ce contrôle reste donc manuel.
+
+### 7.4 Comparaison des deux outils
+
+| Critère | Dependency-Check | Trivy |
+|---|---|---|
+| Base de vulnérabilités | NVD (NIST) | Base Trivy (avis GitHub, NVD…) |
+| Préparation de la base | ~412 000 CVE : plusieurs heures via l'API, **4 s** avec le miroir | ~129 Mo en **≈ 4 s** |
+| Durée totale du workflow (version finale) | ≈ 30 s à 1 min | ≈ 1 min 20 s |
+| log4j / Tomcat | Détectés | Non vus avant la correction du mode (`fs`) |
+| Jackson 2.21.5 / 3.1.5 | Non signalés au-dessus du seuil | **Détectés** (HIGH) avec version corrigée |
+| JavaScript embarqué dans un jar (DOMPurify) | **Détecté** | Non signalé |
+| Seuil bloquant | `failBuildOnCVSS = 7` | `--severity HIGH,CRITICAL --exit-code 1` |
+| Rapport | HTML + JSON (artefact) | Texte (artefact) |
+
+Aucun des deux outils n'a vu exactement les mêmes choses : les utiliser ensemble **réduit les angles morts**.
+
+---
+
+## 8. Limites et recommandations
+
+### 8.1 Limites de la SCA
+
+- **Vulnérabilités connues uniquement** : un outil SCA ne trouve que les failles déjà publiées (CVE) ; une faille non divulguée (*zero-day*) passe inaperçue.
+- **Faux positifs** : la correspondance par CPE de Dependency-Check peut associer une CVE à un composant qui n'est pas réellement concerné. Chaque résultat demande une revue.
+- **Exploitabilité non évaluée** : une dépendance vulnérable n'est pas forcément exploitable dans le contexte de l'application (fonction vulnérable jamais appelée).
+- **Le code du projet n'est pas analysé** : c'est le rôle du SAST (workshop 1).
+
+### 8.2 Limites propres à ce workshop
+
+- La base NVD provient d'un **miroir communautaire** (`diktamen/nvd-mirror`), non officiel OWASP. L'empreinte SHA-256 garantit l'intégrité du téléchargement, mais pas l'authenticité du contenu publié par ce dépôt.
+- La base du miroir est mise à jour **une fois par nuit** ; sans `NVD_API_KEY`, les CVE publiées depuis la dernière génération ne sont pas prises en compte.
+- L'analyseur **Sonatype OSS Index** est désactivé (identifiants manquants), ce qui retire une source de données à Dependency-Check.
+- L'image **`aquasec/trivy:latest`** est un tag mobile : le comportement de Trivy peut changer d'une exécution à l'autre.
+- Le workflow Trivy ne s'exécute pas sur les pull requests (`push` sur `main` et `workflow_dispatch` uniquement).
+- Les actions `checkout@v4`, `setup-java@v4` et `upload-artifact@v4` déclenchent un avertissement de dépréciation de Node.js 20.
+- Les CVE DOMPurify (dans Swagger UI, sévérité LOW) restent ouvertes car sous le seuil de 7.
+- Les corrections Tomcat et Jackson **forcent** des versions différentes de celles validées par Spring Boot 4.1.1 : il faudra les retirer lorsqu'une version de Spring Boot les intégrera.
+
+### 8.3 Recommandations
+
+1. **Ajouter `NVD_API_KEY`** dans les secrets *Actions* et *Dependabot* de chaque dépôt.
+2. **Déclencher Trivy aussi sur les pull requests**, pour bloquer une dépendance vulnérable avant la fusion.
+3. **Fixer une version précise** de l'image Trivy au lieu de `latest`.
+4. **Fusionner les pull requests Dependabot** des actions GitHub une fois les workflows verts.
+5. **Mettre à jour `springdoc-openapi`** dès qu'une version embarque un DOMPurify corrigé.
+6. **Publier les rapports au format SARIF** dans l'onglet *Security* de GitHub (*code scanning*).
+7. Pour un usage en entreprise, **héberger son propre miroir NVD** (outil `vulnz` ou workflow planifié) plutôt que de dépendre d'un dépôt tiers.
+8. **Ajouter des tests automatisés** pour vérifier qu'une montée de version de dépendance ne casse pas l'application.
+
+---
+
+## 9. Conclusion
+
+Ce workshop a mis en place une chaîne **SCA** automatisée dans GitHub Actions avec deux outils complémentaires : **OWASP Dependency-Check**, adossé à la base NVD du NIST, et **Trivy**, complétés par **Dependabot** pour les mises à jour.
+
+Le diagnostic des journaux a révélé deux problèmes qui faussaient complètement les résultats initiaux :
+
+- un workflow **Trivy vert qui n'analysait aucun fichier** : corrigé en passant Trivy en mode `rootfs` ;
+- un workflow **Dependency-Check qui ne terminait jamais** parce qu'il retéléchargeait la NVD entière (412 000 CVE) à chaque exécution : corrigé par une **base NVD pré-construite**, vérifiée par SHA-256 et complétée par une mise à jour incrémentale, ce qui ramène le workflow de plusieurs heures à **moins d'une minute**.
+
+Une fois les outils fiables, ils ont détecté des vulnérabilités réelles : **Log4Shell** (CVE-2021-44228, 10.0) dans une dépendance inutilisée, des failles critiques de **Tomcat** (jusqu'à 9.8) et des failles **Jackson** que seul Trivy a signalées.
+
+Les corrections (suppression de log4j, forçage de Tomcat 11.0.27 et Jackson 2.21.8 / 3.1.8) ont été **retestées** : les deux workflows sont verts et l'application démarre normalement.
+
+Un workflow vert ne garantit pas l'absence de vulnérabilité : il faut vérifier **ce qu'il a réellement analysé**, et compléter la SCA par le SAST et, à terme, par des tests dynamiques.
+
+---
+
+## 10. Références
+
+- OWASP Dependency-Check : https://owasp.org/www-project-dependency-check/
+- Dependency-Check — plugin Maven : https://dependency-check.github.io/DependencyCheck/dependency-check-maven/
+- Dependency-Check — miroir des données NVD : https://dependency-check.github.io/DependencyCheck/data/mirrornvd.html
+- Dependency-Check — issue « Very long time to download NVD data » : https://github.com/dependency-check/DependencyCheck/issues/8493
+- Base NVD pré-construite `diktamen/nvd-mirror` : https://github.com/diktamen/nvd-mirror
+- NVD — demande de clé API : https://nvd.nist.gov/developers/request-an-api-key
+- Trivy — documentation : https://trivy.dev/
+- Trivy — Java (jar en `rootfs` / `image`, `pom.xml` en `fs`) : https://trivy.dev/latest/docs/coverage/language/java/
+- GitHub Actions — secrets : https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions
+- GitHub Actions — cache des dépendances : https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows
+- Dependabot — configuration : https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+- Maven — import de BOM et gestion des dépendances : https://maven.apache.org/guides/introduction/introduction-to-dependency-mechanism.html
+- CVE-2021-44228 (Log4Shell) : https://nvd.nist.gov/vuln/detail/CVE-2021-44228
