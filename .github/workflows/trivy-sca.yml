@@ -1,0 +1,46 @@
+name: SCA Trivy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  trivy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: maven
+
+      - name: Télécharger les jars des dépendances
+        run: |
+          chmod +x mvnw
+          ./mvnw -B dependency:copy-dependencies -DoutputDirectory=target/libs
+
+      # "fs" n'analyse pas les .jar (seulement pom.xml) : "rootfs" lit les jars copies dans target/libs
+      - name: Scan des dépendances (Trivy)
+        run: |
+          docker run --rm \
+            -v "$PWD":/src \
+            aquasec/trivy:latest rootfs \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --output /src/trivy-report.txt \
+            /src
+
+      - name: Afficher le rapport
+        if: always()
+        run: cat trivy-report.txt
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-report.txt
