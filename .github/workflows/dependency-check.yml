@@ -46,6 +46,10 @@ jobs:
         env:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
+          if [ -z "$NVD_API_KEY" ]; then
+            echo "::warning::Secret NVD_API_KEY absent : scan avec la base du miroir (mise a jour quotidienne) sans rattrapage incremental"
+            exit 0
+          fi
           ./mvnw -B org.owasp:dependency-check-maven:update-only \
             "-DdataDirectory=$DC_DATA" \
             -DnvdApiKeyEnvironmentVariable=NVD_API_KEY
